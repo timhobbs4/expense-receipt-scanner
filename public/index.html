@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#2563eb" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <title>Receipt Tracker</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- ── App Shell ── -->
+  <div id="app">
+
+    <!-- ── Header ── -->
+    <header class="app-header">
+      <button id="btn-back" class="btn-icon hidden" aria-label="Back">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+      </button>
+      <h1 id="page-title">My Receipts</h1>
+      <div class="header-actions">
+        <button id="btn-summary" class="btn-icon" title="Summary" aria-label="Summary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ════════════════════════════════════════
+         VIEW: Receipt List
+    ════════════════════════════════════════ -->
+    <section id="view-list" class="view active">
+      <div id="list-empty" class="empty-state hidden">
+        <div class="empty-icon">🧾</div>
+        <p>No receipts yet.</p>
+        <p class="text-muted">Tap <strong>+</strong> to scan your first receipt.</p>
+      </div>
+      <div id="receipt-list" class="receipt-grid"></div>
+    </section>
+
+    <!-- ════════════════════════════════════════
+         VIEW: Capture
+    ════════════════════════════════════════ -->
+    <section id="view-capture" class="view">
+      <div class="capture-area" id="capture-area">
+        <div id="capture-placeholder" class="capture-placeholder">
+          <div class="capture-icon">📷</div>
+          <p>Take a photo or choose an image of your receipt</p>
+        </div>
+        <img id="capture-preview" class="capture-preview hidden" alt="Receipt preview" />
+      </div>
+
+      <div class="capture-actions">
+        <label class="btn btn-primary btn-lg" for="file-camera">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+          Camera
+        </label>
+        <input type="file" id="file-camera" accept="image/*" capture="environment" class="hidden" />
+
+        <label class="btn btn-outline btn-lg" for="file-upload">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Upload
+        </label>
+        <input type="file" id="file-upload" accept="image/*" class="hidden" />
+      </div>
+
+      <div id="ocr-status" class="ocr-status hidden">
+        <div class="spinner"></div>
+        <span>Scanning receipt…</span>
+      </div>
+
+      <button id="btn-scan" class="btn btn-success btn-block hidden">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Scan Receipt
+      </button>
+    </section>
+
+    <!-- ════════════════════════════════════════
+         VIEW: Receipt Form (new / edit)
+    ════════════════════════════════════════ -->
+    <section id="view-form" class="view">
+      <form id="receipt-form" novalidate>
+        <input type="hidden" id="field-id" />
+        <input type="hidden" id="field-image" />
+
+        <!-- Image thumb -->
+        <div id="form-image-wrap" class="form-image-wrap hidden">
+          <img id="form-image-thumb" class="form-image-thumb" alt="Receipt" />
+        </div>
+
+        <!-- Vendor + Date row -->
+        <div class="form-row">
+          <div class="form-group flex-2">
+            <label for="field-vendor">Vendor</label>
+            <input type="text" id="field-vendor" placeholder="e.g. Tim Hortons" autocomplete="off" />
+          </div>
+          <div class="form-group flex-1">
+            <label for="field-date">Date</label>
+            <input type="date" id="field-date" />
+          </div>
+        </div>
+
+        <!-- Category + Currency row -->
+        <div class="form-row">
+          <div class="form-group flex-2">
+            <label for="field-category">Category</label>
+            <select id="field-category">
+              <option value="Meals &amp; Entertainment">Meals &amp; Entertainment</option>
+              <option value="Accommodation">Accommodation</option>
+              <option value="Transportation">Transportation</option>
+              <option value="Office Supplies">Office Supplies</option>
+              <option value="Software &amp; Tools">Software &amp; Tools</option>
+              <option value="Conferences &amp; Events">Conferences &amp; Events</option>
+              <option value="Other" selected>Other</option>
+            </select>
+          </div>
+          <div class="form-group flex-1">
+            <label for="field-currency">Currency</label>
+            <select id="field-currency">
+              <option value="CAD">CAD</option>
+              <option value="USD">USD</option>
+              <option value="EUR">EUR</option>
+              <option value="GBP">GBP</option>
+              <option value="AUD">AUD</option>
+              <option value="JPY">JPY</option>
+              <option value="MXN">MXN</option>
+              <option value="CHF">CHF</option>
+              <option value="CNY">CNY</option>
+              <option value="HKD">HKD</option>
+              <option value="SGD">SGD</option>
+              <option value="Other">Other…</option>
+            </select>
+            <input type="text" id="field-currency-custom" placeholder="e.g. BRL" maxlength="3" class="hidden mt-1" />
+          </div>
+        </div>
+
+        <!-- Amounts section -->
+        <div class="card amounts-card">
+          <div class="amounts-grid">
+            <div class="form-group">
+              <label for="field-subtotal">Subtotal</label>
+              <div class="input-prefix">
+                <span class="currency-prefix" id="currency-prefix">$</span>
+                <input type="number" id="field-subtotal" min="0" step="0.01" placeholder="0.00" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="field-gst">GST / HST</label>
+              <div class="input-prefix">
+                <span class="currency-prefix" id="currency-prefix-gst">$</span>
+                <input type="number" id="field-gst" min="0" step="0.01" placeholder="0.00" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="field-pst">PST / QST</label>
+              <div class="input-prefix">
+                <span class="currency-prefix" id="currency-prefix-pst">$</span>
+                <input type="number" id="field-pst" min="0" step="0.01" placeholder="0.00" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="field-gratuity">Gratuity / Tip</label>
+              <div class="input-prefix">
+                <span class="currency-prefix" id="currency-prefix-tip">$</span>
+                <input type="number" id="field-gratuity" min="0" step="0.01" placeholder="0.00" />
+              </div>
+            </div>
+          </div>
+
+          <div class="total-row">
+            <label for="field-total">Total</label>
+            <div class="input-prefix total-input">
+              <span class="currency-prefix total-prefix" id="currency-prefix-total">$</span>
+              <input type="number" id="field-total" min="0" step="0.01" placeholder="0.00" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Notes -->
+        <div class="form-group">
+          <label for="field-notes">Notes</label>
+          <textarea id="field-notes" rows="2" placeholder="Optional notes…"></textarea>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary btn-block" id="btn-save">Save Receipt</button>
+          <button type="button" class="btn btn-danger btn-block hidden" id="btn-delete">Delete Receipt</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ════════════════════════════════════════
+         VIEW: Summary
+    ════════════════════════════════════════ -->
+    <section id="view-summary" class="view">
+      <div class="summary-filters">
+        <select id="summary-currency-filter">
+          <option value="">All Currencies</option>
+        </select>
+      </div>
+      <div id="summary-cards" class="summary-cards"></div>
+      <div id="summary-breakdown" class="summary-breakdown"></div>
+    </section>
+
+    <!-- ── FAB: New Receipt ── -->
+    <button id="fab" class="fab" aria-label="Add receipt" title="Add receipt">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+
+  </div><!-- /#app -->
+
+  <!-- ── Toast ── -->
+  <div id="toast" class="toast hidden" role="alert"></div>
+
+  <!-- ── Confirm Dialog ── -->
+  <div id="confirm-overlay" class="overlay hidden">
+    <div class="confirm-dialog">
+      <p id="confirm-message">Are you sure?</p>
+      <div class="confirm-actions">
+        <button id="confirm-cancel" class="btn btn-outline">Cancel</button>
+        <button id="confirm-ok" class="btn btn-danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
