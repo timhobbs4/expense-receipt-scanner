@@ -9,12 +9,20 @@ const Anthropic = require('@anthropic-ai/sdk');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ── Schema isolation ───────────────────────────────────────────────────────────
+// All tables live in a dedicated schema so this app shares the env-factory-db
+// PostgreSQL instance with other projects without touching their tables.
+// Override via DB_SCHEMA env var if needed.
+const SCHEMA = (process.env.DB_SCHEMA || 'receipt_tracker').replace(/[^a-z0-9_]/gi, '');
+const T = `"${SCHEMA}".receipts`; // fully-qualified table reference used in every query
+
 // ── BTP / CF helpers ───────────────────────────────────────────────────────────
 
 /**
  * Build a pg Pool config from VCAP_SERVICES (BTP CF) or DATABASE_URL (local).
- * BTP binds PostgreSQL credentials under any service label whose credentials
- * contain a "uri" starting with "postgres".
+ * Looks for any bound service whose credentials contain a postgres URI —
+ * this matches the existing env-factory-db instance by its bound credentials
+ * regardless of the CF service label name.
  */
 function getDbConfig() {
   if (process.env.VCAP_SERVICES) {
@@ -30,7 +38,7 @@ function getDbConfig() {
       return { connectionString: uri, ssl: { rejectUnauthorized: false } };
     }
   }
-  // Local dev — set DATABASE_URL or rely on pg defaults (PGHOST/PGUSER/etc.)
+  // Local dev — set DATABASE_URL or rely on pg env vars (PGHOST/PGUSER/etc.)
   return { connectionString: process.env.DATABASE_URL || 'postgresql://localhost/receipts' };
 }
 
@@ -55,24 +63,32 @@ function getAnthropicKey() {
 const pool = new Pool(getDbConfig());
 
 async function initDb() {
+  // Create the schema if it does not exist. Using IF NOT EXISTS means this is
+  // safe to run on every startup — it is a no-op when the schema is already there.
+  await pool.query(`CREATE SCHEMA IF NOT EXISTS "${SCHEMA}"`);
+
+  // Create the receipts table inside the dedicated schema.
+  // IF NOT EXISTS prevents any conflict with tables owned by other projects.
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS receipts (
+    CREATE TABLE IF NOT EXISTS ${T} (
       id         TEXT PRIMARY KEY,
       vendor     TEXT,
       date       TEXT,
-      currency   TEXT        DEFAULT 'CAD',
+      currency   TEXT             DEFAULT 'CAD',
       total      DOUBLE PRECISION,
       subtotal   DOUBLE PRECISION,
       gst        DOUBLE PRECISION,
       pst        DOUBLE PRECISION,
       gratuity   DOUBLE PRECISION,
-      category   TEXT        DEFAULT 'Other',
+      category   TEXT             DEFAULT 'Other',
       image_data TEXT,
       notes      TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
+      created_at TIMESTAMPTZ      DEFAULT NOW(),
+      updated_at TIMESTAMPTZ      DEFAULT NOW()
     )
   `);
+
+  console.log(`Database ready — using schema "${SCHEMA}"`);
 }
 
 // ── Anthropic client (lazy) ────────────────────────────────────────────────────
@@ -102,7 +118,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Health check (required by BTP CF health-check-type: http) ─────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', schema: SCHEMA, timestamp: new Date().toISOString() });
 });
 
 // ── OCR endpoint ───────────────────────────────────────────────────────────────
@@ -119,26 +135,7 @@ app.post('/api/ocr', upload.single('receipt'), async (req, res) => {
   const base64Image = req.file.buffer.toString('base64');
   const mediaType = req.file.mimetype;
 
-  const prompt = `You are a receipt OCR assistant. Analyze this receipt image and extract the following data.
-
-Return ONLY a valid JSON object with exactly these fields (use null for any field you cannot determine):
-
-{
-  "vendor": "business/restaurant name as printed on receipt",
-  "date": "date in YYYY-MM-DD format",
-  "currency": "3-letter ISO 4217 currency code (e.g. CAD, USD, EUR, GBP) — derive from country context, currency symbols, or tax labels (GST/PST = Canada = CAD). Return null only if truly ambiguous.",
-  "subtotal": numeric value before taxes (number or null),
-  "gst": GST amount if shown (number or null),
-  "pst": PST or QST or HST amount if shown (number or null),
-  "gratuity": tip or gratuity amount if shown (number or null),
-  "total": final total charged (number or null),
-  "suggested_category": "one of: Meals & Entertainment | Accommodation | Transportation | Office Supplies | Software & Tools | Conferences & Events | Other"
-}
-
-Rules:
-- All numeric fields must be plain numbers (no currency symbols, no commas).
-- If only a total is visible and no subtotal breakdown, put the total in "total" and leave subtotal/taxes as null.
-- Do not include any explanation or markdown — only the raw JSON object.`;
+  const prompt = `You are a receipt OCR assistant. Analyze this receipt image and extract the following data.\n\nReturn ONLY a valid JSON object with exactly these fields (use null for any field you cannot determine):\n\n{\n  "vendor": "business/restaurant name as printed on receipt",\n  "date": "date in YYYY-MM-DD format",\n  "currency": "3-letter ISO 4217 currency code (e.g. CAD, USD, EUR, GBP) — derive from country context, currency symbols, or tax labels (GST/PST = Canada = CAD). Return null only if truly ambiguous.",\n  "subtotal": numeric value before taxes (number or null),\n  "gst": GST amount if shown (number or null),\n  "pst": PST or QST or HST amount if shown (number or null),\n  "gratuity": tip or gratuity amount if shown (number or null),\n  "total": final total charged (number or null),\n  "suggested_category": "one of: Meals & Entertainment | Accommodation | Transportation | Office Supplies | Software & Tools | Conferences & Events | Other"\n}\n\nRules:\n- All numeric fields must be plain numbers (no currency symbols, no commas).\n- If only a total is visible and no subtotal breakdown, put the total in "total" and leave subtotal/taxes as null.\n- Do not include any explanation or markdown — only the raw JSON object.`;
 
   try {
     const message = await anthropic.messages.create({
@@ -177,7 +174,7 @@ Rules:
 app.get('/api/receipts', async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT * FROM receipts ORDER BY date DESC NULLS LAST, created_at DESC`
+      `SELECT * FROM ${T} ORDER BY date DESC NULLS LAST, created_at DESC`
     );
     res.json(rows);
   } catch (err) {
@@ -188,7 +185,10 @@ app.get('/api/receipts', async (_req, res) => {
 
 app.get('/api/receipts/:id', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM receipts WHERE id = $1', [req.params.id]);
+    const { rows } = await pool.query(
+      `SELECT * FROM ${T} WHERE id = $1`,
+      [req.params.id]
+    );
     if (!rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
   } catch (err) {
@@ -201,8 +201,7 @@ app.post('/api/receipts', async (req, res) => {
   const r = { id: uuidv4(), ...sanitize(req.body) };
   try {
     await pool.query(
-      `INSERT INTO receipts (id, vendor, date, currency, total, subtotal, gst, pst, gratuity, category, image_data, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      `INSERT INTO ${T} (id, vendor, date, currency, total, subtotal, gst, pst, gratuity, category, image_data, notes)\n       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [r.id, r.vendor, r.date, r.currency, r.total, r.subtotal, r.gst, r.pst, r.gratuity, r.category, r.image_data, r.notes]
     );
     res.status(201).json(r);
@@ -216,10 +215,7 @@ app.put('/api/receipts/:id', async (req, res) => {
   const r = { id: req.params.id, ...sanitize(req.body) };
   try {
     const result = await pool.query(
-      `UPDATE receipts
-       SET vendor=$2, date=$3, currency=$4, total=$5, subtotal=$6, gst=$7, pst=$8,
-           gratuity=$9, category=$10, image_data=$11, notes=$12, updated_at=NOW()
-       WHERE id=$1`,
+      `UPDATE ${T}\n       SET vendor=$2, date=$3, currency=$4, total=$5, subtotal=$6, gst=$7, pst=$8,\n           gratuity=$9, category=$10, image_data=$11, notes=$12, updated_at=NOW()\n       WHERE id=$1`,
       [r.id, r.vendor, r.date, r.currency, r.total, r.subtotal, r.gst, r.pst, r.gratuity, r.category, r.image_data, r.notes]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Not found' });
@@ -232,7 +228,10 @@ app.put('/api/receipts/:id', async (req, res) => {
 
 app.delete('/api/receipts/:id', async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM receipts WHERE id = $1', [req.params.id]);
+    const result = await pool.query(
+      `DELETE FROM ${T} WHERE id = $1`,
+      [req.params.id]
+    );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Not found' });
     res.status(204).end();
   } catch (err) {
@@ -272,13 +271,12 @@ app.get('*', (_req, res) => {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 initDb()
   .then(() => {
-    // BTP CF requires binding to 0.0.0.0
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Receipt Tracker running on http://0.0.0.0:${PORT}`);
       if (!getAnthropicKey()) {
         console.warn(
           'WARNING: ANTHROPIC_API_KEY not found. Set it with:\n' +
-          '  cf set-env <app> ANTHROPIC_API_KEY <key>  (then cf restage)\n' +
+          '  cf set-env receipt-tracker ANTHROPIC_API_KEY <key>  (then cf restage)\n' +
           '  or bind a user-provided service with that credential.'
         );
       }

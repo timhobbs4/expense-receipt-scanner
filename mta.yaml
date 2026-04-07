@@ -7,7 +7,7 @@ description: Mobile receipt expense tracker with Claude Vision OCR
 # Build:  mbt build
 # Deploy: cf deploy mta_archives/receipt-tracker_1.0.0.mtar
 #
-# Or use the CF manifest directly for a simpler workflow:
+# Or use the simpler cf push workflow:
 #   cf push -f manifest.yml
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -32,27 +32,32 @@ modules:
       health-check-http-endpoint: /health
     properties:
       NODE_ENV: production
+      # Schema this app owns inside the shared env-factory-db instance.
+      # All tables are created under this schema; no other project's tables
+      # are touched. Change only if you need parallel isolated deployments.
+      DB_SCHEMA: receipt_tracker
     requires:
-      - name: receipts-db
+      - name: env-factory-db
       - name: anthropic-key
         parameters:
           optional: true
 
 resources:
-  # ── PostgreSQL managed service ────────────────────────────────────────────────
-  # On BTP trial use plan "trial"; on productive accounts use "small" or above.
-  - name: receipts-db
-    type: org.cloudfoundry.managed-service
-    parameters:
-      service: postgresql-db
-      service-plan: trial
+  # ── Existing shared PostgreSQL instance ───────────────────────────────────────
+  # env-factory-db already exists in this BTP space — we bind to it rather than
+  # creating a new service instance. The app will create its own "receipt_tracker"
+  # schema inside this database on first startup.
+  - name: env-factory-db
+    type: org.cloudfoundry.existing-service
 
   # ── Anthropic API key — user-provided service ─────────────────────────────────
   # Create before deploying:
-  #   cf create-user-provided-service anthropic-key -p '{"ANTHROPIC_API_KEY":"sk-ant-..."}'
+  #   cf create-user-provided-service anthropic-key \
+  #      -p '{"ANTHROPIC_API_KEY":"sk-ant-..."}'
   #
   # Alternatively, skip this resource and set the key manually after deploy:
   #   cf set-env receipt-tracker ANTHROPIC_API_KEY sk-ant-...
   #   cf restage receipt-tracker
   - name: anthropic-key
     type: org.cloudfoundry.user-provided-service
+    optional: true

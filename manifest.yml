@@ -3,15 +3,16 @@
 # Deploy with: cf push
 #
 # Prerequisites:
-#   1. Create a PostgreSQL service instance:
-#        cf create-service postgresql-db trial receipts-db
-#   2. Set your Anthropic API key (after cf push):
+#   1. The env-factory-db PostgreSQL service must already exist in your space.
+#      Verify with: cf services
+#
+#   2. Set your Anthropic API key after the first push:
 #        cf set-env receipt-tracker ANTHROPIC_API_KEY <your-key>
 #        cf restage receipt-tracker
 #
-# Or use a user-provided service for the API key instead:
-#   cf create-user-provided-service anthropic-key -p '{"ANTHROPIC_API_KEY":"<key>"}'
-#   (add 'anthropic-key' to the services list below)
+#      Or use a user-provided service (add it to the services list below):
+#        cf create-user-provided-service anthropic-key \
+#           -p '{"ANTHROPIC_API_KEY":"<key>"}'
 
 applications:
   - name: receipt-tracker
@@ -26,8 +27,12 @@ applications:
     health-check-http-endpoint: /health
 
     services:
-      - receipts-db          # PostgreSQL service instance (see Prerequisites above)
-      # - anthropic-key      # Uncomment if using a user-provided service for the API key
+      - env-factory-db        # Existing shared PostgreSQL instance in this space
+      # - anthropic-key       # Uncomment if using a user-provided service for the API key
 
     env:
       NODE_ENV: production
+      # This app creates and owns the "receipt_tracker" schema inside env-factory-db.
+      # Change DB_SCHEMA only if you need to run multiple isolated instances of this
+      # app against the same database (e.g. staging vs. production in one space).
+      DB_SCHEMA: receipt_tracker
