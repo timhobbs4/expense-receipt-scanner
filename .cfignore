@@ -1,0 +1,22 @@
+# Dependencies — BTP buildpack installs these from package.json
+node_modules/
+
+# Local database and secrets
+data/
+*.db
+.env
+
+# macOS
+.DS_Store
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# EC2 / CodeDeploy (not needed on BTP)
+scripts/
+appspec.yml
+
+# Logs
+npm-debug.log*

@@ -3,44 +3,90 @@ const express = require('express');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
-const fs = require('fs');
+const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
-const Database = require('better-sqlite3');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Database setup ─────────────────────────────────────────────────────────────
-const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+// ── BTP / CF helpers ───────────────────────────────────────────────────────────
 
-const db = new Database(path.join(DATA_DIR, 'receipts.db'));
+/**
+ * Build a pg Pool config from VCAP_SERVICES (BTP CF) or DATABASE_URL (local).
+ * BTP binds PostgreSQL credentials under any service label whose credentials
+ * contain a "uri" starting with "postgres".
+ */
+function getDbConfig() {
+  if (process.env.VCAP_SERVICES) {
+    const vcap = JSON.parse(process.env.VCAP_SERVICES);
+    const allServices = Object.values(vcap).flat();
+    const pgSvc = allServices.find(
+      (s) =>
+        s.credentials?.uri?.startsWith('postgres') ||
+        s.credentials?.url?.startsWith('postgres')
+    );
+    if (pgSvc) {
+      const uri = pgSvc.credentials.uri || pgSvc.credentials.url;
+      return { connectionString: uri, ssl: { rejectUnauthorized: false } };
+    }
+  }
+  // Local dev — set DATABASE_URL or rely on pg defaults (PGHOST/PGUSER/etc.)
+  return { connectionString: process.env.DATABASE_URL || 'postgresql://localhost/receipts' };
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS receipts (
-    id         TEXT PRIMARY KEY,
-    vendor     TEXT,
-    date       TEXT,
-    currency   TEXT DEFAULT 'CAD',
-    total      REAL,
-    subtotal   REAL,
-    gst        REAL,
-    pst        REAL,
-    gratuity   REAL,
-    category   TEXT DEFAULT 'Other',
-    image_data TEXT,
-    notes      TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now'))
-  )
-`);
+/**
+ * Resolve the Anthropic API key:
+ *   1. Process env (local dev / cf set-env)
+ *   2. A CF user-provided service with credential key ANTHROPIC_API_KEY
+ */
+function getAnthropicKey() {
+  if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
+  if (process.env.VCAP_SERVICES) {
+    const vcap = JSON.parse(process.env.VCAP_SERVICES);
+    const ups = vcap['user-provided'] || [];
+    for (const svc of ups) {
+      if (svc.credentials?.ANTHROPIC_API_KEY) return svc.credentials.ANTHROPIC_API_KEY;
+    }
+  }
+  return null;
+}
 
-// ── Anthropic client ───────────────────────────────────────────────────────────
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// ── Database ───────────────────────────────────────────────────────────────────
+const pool = new Pool(getDbConfig());
 
-// ── Multer (in-memory storage so we can pass base64 to Claude) ─────────────────
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS receipts (
+      id         TEXT PRIMARY KEY,
+      vendor     TEXT,
+      date       TEXT,
+      currency   TEXT        DEFAULT 'CAD',
+      total      DOUBLE PRECISION,
+      subtotal   DOUBLE PRECISION,
+      gst        DOUBLE PRECISION,
+      pst        DOUBLE PRECISION,
+      gratuity   DOUBLE PRECISION,
+      category   TEXT        DEFAULT 'Other',
+      image_data TEXT,
+      notes      TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+}
+
+// ── Anthropic client (lazy) ────────────────────────────────────────────────────
+let _anthropic = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const key = getAnthropicKey();
+    if (!key) return null;
+    _anthropic = new Anthropic({ apiKey: key });
+  }
+  return _anthropic;
+}
+
+// ── Multer (memory storage — BTP file system is ephemeral) ────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
@@ -54,11 +100,20 @@ const upload = multer({
 app.use(express.json({ limit: '25mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ── Health check (required by BTP CF health-check-type: http) ─────────────────
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // ── OCR endpoint ───────────────────────────────────────────────────────────────
 app.post('/api/ocr', upload.single('receipt'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image file provided' });
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
+
+  const anthropic = getAnthropic();
+  if (!anthropic) {
+    return res.status(500).json({
+      error: 'ANTHROPIC_API_KEY is not configured. Set it via cf set-env or a user-provided service.',
+    });
   }
 
   const base64Image = req.file.buffer.toString('base64');
@@ -93,10 +148,7 @@ Rules:
         {
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: base64Image },
-            },
+            { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Image } },
             { type: 'text', text: prompt },
           ],
         },
@@ -104,8 +156,6 @@ Rules:
     });
 
     const rawText = message.content[0].text.trim();
-
-    // Strip markdown code fences if model wraps response
     const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
 
     let extracted;
@@ -115,9 +165,7 @@ Rules:
       return res.status(422).json({ error: 'Could not parse OCR response', raw: rawText });
     }
 
-    // Return the base64 image back so the client can preview it without re-uploading
     extracted.image_data = `data:${mediaType};base64,${base64Image}`;
-
     return res.json(extracted);
   } catch (err) {
     console.error('Claude API error:', err);
@@ -126,56 +174,71 @@ Rules:
 });
 
 // ── Receipts CRUD ──────────────────────────────────────────────────────────────
-const getAll = db.prepare(`
-  SELECT * FROM receipts ORDER BY date DESC, created_at DESC
-`);
-
-const getOne = db.prepare(`SELECT * FROM receipts WHERE id = ?`);
-
-const insert = db.prepare(`
-  INSERT INTO receipts (id, vendor, date, currency, total, subtotal, gst, pst, gratuity, category, image_data, notes)
-  VALUES (@id, @vendor, @date, @currency, @total, @subtotal, @gst, @pst, @gratuity, @category, @image_data, @notes)
-`);
-
-const update = db.prepare(`
-  UPDATE receipts
-  SET vendor=@vendor, date=@date, currency=@currency, total=@total, subtotal=@subtotal,
-      gst=@gst, pst=@pst, gratuity=@gratuity, category=@category, image_data=@image_data,
-      notes=@notes, updated_at=datetime('now')
-  WHERE id=@id
-`);
-
-const remove = db.prepare(`DELETE FROM receipts WHERE id = ?`);
-
-app.get('/api/receipts', (_req, res) => {
-  res.json(getAll.all());
+app.get('/api/receipts', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM receipts ORDER BY date DESC NULLS LAST, created_at DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/api/receipts/:id', (req, res) => {
-  const row = getOne.get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json(row);
+app.get('/api/receipts/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM receipts WHERE id = $1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/api/receipts', (req, res) => {
-  const receipt = { id: uuidv4(), ...sanitize(req.body) };
-  insert.run(receipt);
-  res.status(201).json(receipt);
+app.post('/api/receipts', async (req, res) => {
+  const r = { id: uuidv4(), ...sanitize(req.body) };
+  try {
+    await pool.query(
+      `INSERT INTO receipts (id, vendor, date, currency, total, subtotal, gst, pst, gratuity, category, image_data, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [r.id, r.vendor, r.date, r.currency, r.total, r.subtotal, r.gst, r.pst, r.gratuity, r.category, r.image_data, r.notes]
+    );
+    res.status(201).json(r);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.put('/api/receipts/:id', (req, res) => {
-  const existing = getOne.get(req.params.id);
-  if (!existing) return res.status(404).json({ error: 'Not found' });
-  const receipt = { id: req.params.id, ...sanitize(req.body) };
-  update.run(receipt);
-  res.json(receipt);
+app.put('/api/receipts/:id', async (req, res) => {
+  const r = { id: req.params.id, ...sanitize(req.body) };
+  try {
+    const result = await pool.query(
+      `UPDATE receipts
+       SET vendor=$2, date=$3, currency=$4, total=$5, subtotal=$6, gst=$7, pst=$8,
+           gratuity=$9, category=$10, image_data=$11, notes=$12, updated_at=NOW()
+       WHERE id=$1`,
+      [r.id, r.vendor, r.date, r.currency, r.total, r.subtotal, r.gst, r.pst, r.gratuity, r.category, r.image_data, r.notes]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    res.json(r);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.delete('/api/receipts/:id', (req, res) => {
-  const existing = getOne.get(req.params.id);
-  if (!existing) return res.status(404).json({ error: 'Not found' });
-  remove.run(req.params.id);
-  res.status(204).end();
+app.delete('/api/receipts/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM receipts WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    res.status(204).end();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -206,10 +269,22 @@ app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`Receipt Tracker running on http://localhost:${PORT}`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('WARNING: ANTHROPIC_API_KEY is not set. OCR will not work.');
-  }
-});
+// ── Boot ──────────────────────────────────────────────────────────────────────
+initDb()
+  .then(() => {
+    // BTP CF requires binding to 0.0.0.0
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Receipt Tracker running on http://0.0.0.0:${PORT}`);
+      if (!getAnthropicKey()) {
+        console.warn(
+          'WARNING: ANTHROPIC_API_KEY not found. Set it with:\n' +
+          '  cf set-env <app> ANTHROPIC_API_KEY <key>  (then cf restage)\n' +
+          '  or bind a user-provided service with that credential.'
+        );
+      }
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialise database:', err);
+    process.exit(1);
+  });
