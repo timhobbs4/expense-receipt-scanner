@@ -1,0 +1,33 @@
+---
+# SAP BTP Cloud Foundry deployment manifest
+# Deploy with: cf push
+#
+# Prerequisites:
+#   1. Create a PostgreSQL service instance:
+#        cf create-service postgresql-db trial receipts-db
+#   2. Set your Anthropic API key (after cf push):
+#        cf set-env receipt-tracker ANTHROPIC_API_KEY <your-key>
+#        cf restage receipt-tracker
+#
+# Or use a user-provided service for the API key instead:
+#   cf create-user-provided-service anthropic-key -p '{"ANTHROPIC_API_KEY":"<key>"}'
+#   (add 'anthropic-key' to the services list below)
+
+applications:
+  - name: receipt-tracker
+    path: .
+    buildpack: nodejs_buildpack
+    memory: 256M
+    disk_quota: 512M
+    instances: 1
+    timeout: 120
+
+    health-check-type: http
+    health-check-http-endpoint: /health
+
+    services:
+      - receipts-db          # PostgreSQL service instance (see Prerequisites above)
+      # - anthropic-key      # Uncomment if using a user-provided service for the API key
+
+    env:
+      NODE_ENV: production
